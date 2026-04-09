@@ -7,13 +7,6 @@ description: Set up a local Splunk Enterprise lab with ESCU detections and attac
 
 Spin up a local Splunk Enterprise instance via Docker with 2000+ ESCU detection rules, attack datasets, and all macros/lookups pre-configured. Used for SIEM rule migration testing.
 
-## Prerequisites
-
-- Docker & Docker Compose
-- Git LFS (`brew install git-lfs && git lfs install --skip-smudge`)
-- Python 3.11 (use `mise install python@3.11` if needed; `contentctl` does not work with Python 3.14+)
-- Free Splunkbase account for downloading Technology Add-ons
-
 ## Agent Directives
 
 > **IMPORTANT**: After the setup script finishes, you MUST explicitly tell the user that they need to manually download three Technology Add-ons from Splunkbase before detections will work. Field extraction depends on these TAs — without them, ingested logs remain raw XML and no detection rules will fire. Do NOT proceed to data ingestion or rule export without confirming the user has installed the TAs and restarted Splunk.
@@ -26,6 +19,13 @@ Spin up a local Splunk Enterprise instance via Docker with 2000+ ESCU detection 
 >
 > Once downloaded, I'll install them for you."
 
+## Prerequisites
+
+- Docker & Docker Compose
+- Git LFS (`brew install git-lfs && git lfs install --skip-smudge`)
+- Python 3.11 via `mise` (`mise install python@3.11`). **`contentctl` does NOT work with Python 3.14+** — it crashes with `AttributeError: __class_getitem__`.
+- Free Splunkbase account for downloading Technology Add-ons
+
 ## Quick Start
 
 From the repo root (`~/projects/Splunk_lab`):
@@ -36,13 +36,66 @@ From the repo root (`~/projects/Splunk_lab`):
 
 This will:
 1. Start Splunk Enterprise via `docker compose up` (runs under Rosetta on Apple Silicon)
-2. Clone `splunk/security_content` and build the ESCU app
-3. Clone `splunk/attack_data` for test datasets
-4. Install ESCU on Splunk and enable HEC
+2. Clone `splunk/security_content` and enrichment repos (`atomic-red-team`, `mitre/cti`)
+3. Build ESCU app via `contentctl build --enrichments` using Python 3.11
+4. Install ESCU on Splunk via `docker cp` + `splunk install app` CLI
+5. Clone `splunk/attack_data` for test datasets (Git LFS, smudge-skipped)
+6. Enable HEC and create a token for data ingestion
+
+### Known Timing
+
+- Initial Splunk startup: ~60-90s (Rosetta emulation on Apple Silicon)
+- `contentctl build --enrichments`: ~15-20s
+- Splunk restart after ESCU install: ~60-90s (background restart, polled for readiness)
+- Total: ~5-10 minutes depending on git clone speeds
+
+## Critical Implementation Details
+
+### Splunk Health/Readiness Check
+
+**Do NOT use** `/services/server/health/splunkd` — it returns XML regardless of headers and `grep` for JSON status strings will never match.
+
+**Use instead:**
+```bash
+curl -ks "https://localhost:8089/services/server/info?output_mode=json" \
+  -u "admin:ChangeMeN0w!" | python3 -c "import sys,json; json.load(sys.stdin)"
+```
+This returns valid JSON when Splunk is ready and fails otherwise. Use it in an `until` loop.
+
+### ESCU App Installation
+
+**Do NOT use** the Splunk REST API multipart upload (`/services/apps/local` with `-F appfile=@...`) — it fails silently.
+
+**Use instead:**
+```bash
+docker cp <escu_tarball> splunk-lab:/tmp/escu.tar.gz
+docker exec -u splunk splunk-lab /opt/splunk/bin/splunk install app /tmp/escu.tar.gz -auth "admin:ChangeMeN0w!"
+```
+
+### Splunk Restart After App Install
+
+Run restart in background (`&`) because it blocks the terminal, then poll the info endpoint:
+```bash
+docker exec -u splunk splunk-lab /opt/splunk/bin/splunk restart -auth "admin:ChangeMeN0w!" &
+sleep 30
+until curl -ks "https://localhost:8089/services/server/info?output_mode=json" \
+  -u "admin:ChangeMeN0w!" 2>/dev/null | python3 -c "import sys,json; json.load(sys.stdin)" 2>/dev/null; do
+  sleep 5
+done
+```
+
+### contentctl Build Requirements
+
+`contentctl build --enrichments` requires two external repos cloned into `repos/security_content/external_repos/`:
+```bash
+git clone --depth 1 --single-branch https://github.com/redcanaryco/atomic-red-team external_repos/atomic-red-team
+git clone --depth 1 --single-branch https://github.com/mitre/cti external_repos/cti
+```
+Without these, the build fails with missing enrichment data.
 
 ## Manual Step: Install Technology Add-ons (REQUIRED)
 
-**This step cannot be automated.** Without these TAs, ingested logs stay as raw XML and detection rules will not fire.
+**This step cannot be automated.** Without these TAs, ingested logs stay as raw XML and detection rules will not fire (fields like `EventCode`, `Image`, `CommandLine`, `process_name` are not extracted).
 
 After setup, download these from Splunkbase (free account required) and install:
 
@@ -93,15 +146,11 @@ print(f'Exported {len(macros)} macros')
 "
 ```
 
-The output format (`{"result": {"title": ..., "definition": ...}}`) is what the Kibana SIEM Migrations UI expects for macro upload.
+The output format (`{"result": {"title": ..., "definition": ...}}`) is what the Kibana SIEM Migrations UI expects for macro upload. A flat array of `{name, definition}` objects will fail with "non-object entries".
 
 ### Export Lookups
 
 ```bash
-# List all ESCU lookup files
-docker exec splunk-lab ls /opt/splunk/etc/apps/DA-ESS-ContentUpdate/lookups/
-
-# Copy all CSV lookups locally
 mkdir -p lookups
 for f in $(docker exec splunk-lab ls /opt/splunk/etc/apps/DA-ESS-ContentUpdate/lookups/ | grep .csv); do
   docker cp "splunk-lab:/opt/splunk/etc/apps/DA-ESS-ContentUpdate/lookups/$f" "lookups/$f"
@@ -147,12 +196,18 @@ docker compose down      # Stop, preserve data
 docker compose down -v   # Stop and delete all data
 ```
 
+To fully clean up (including cloned repos):
+```bash
+docker compose down -v && rm -rf repos apps data exported_rules
+```
+
 ## Architecture Notes
 
 - `splunk/splunk` Docker image is Intel-only; uses `platform: linux/amd64` for Rosetta emulation on Apple Silicon
-- ESCU is built from source via `contentctl build --enrichments` (requires `atomic-red-team` and `mitre/cti` repos)
-- Attack datasets use Git LFS; files are pulled on-demand per dataset
-- Splunk's `SPLUNK_GENERAL_TERMS=--accept-sgt-current-at-splunk-com` env var is required since Splunk 10.x
+- Splunk 10.x requires `SPLUNK_GENERAL_TERMS=--accept-sgt-current-at-splunk-com` in addition to `SPLUNK_START_ARGS=--accept-license`
+- ESCU is built from source via `contentctl build --enrichments` (requires `atomic-red-team` and `mitre/cti` repos in `external_repos/`)
+- Attack datasets use Git LFS; files are pulled on-demand per dataset via `git lfs pull --include=<path>`
+- HEC token is created programmatically; both the global HEC input and a named token must be enabled
 
 ## Troubleshooting
 
@@ -160,6 +215,10 @@ docker compose down -v   # Stop and delete all data
 |-------|-----|
 | `no matching manifest for linux/arm64/v8` | Add `platform: linux/amd64` to docker-compose.yml |
 | `License not accepted` | Add `SPLUNK_GENERAL_TERMS=--accept-sgt-current-at-splunk-com` env var |
-| `contentctl` crashes with `AttributeError: __class_getitem__` | Use Python 3.11, not 3.14+ |
+| `contentctl` crashes with `AttributeError: __class_getitem__` | Use Python 3.11 via `mise`, not system Python 3.14+ |
+| `contentctl build --enrichments` fails with missing data | Clone `atomic-red-team` and `mitre/cti` into `external_repos/` |
+| Health check loops forever | Use `/services/server/info?output_mode=json`, NOT `/services/server/health/splunkd` (returns XML) |
+| ESCU install via REST API fails silently | Use `docker cp` + `splunk install app` CLI instead of curl multipart upload |
+| Splunk restart hangs terminal | Run restart with `&` (background), then poll info endpoint |
 | Fields not extracted (no EventCode, Image, etc.) | Install the Windows TA, Sysmon TA, and CIM from Splunkbase |
-| Macros upload fails with "non-object entries" | Export macros in Splunk format: `{"result": {"title": ..., "definition": ...}}` |
+| Macros upload fails with "non-object entries" | Export macros in Splunk format: `[{"result": {"title": ..., "definition": ...}}]` |
