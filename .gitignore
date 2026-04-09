@@ -1,0 +1,22 @@
+# Cloned repositories (large, recreated by setup)
+repos/
+
+# Splunk apps downloaded from Splunkbase
+apps/
+
+# Shared data directory
+data/
+
+# Exported rules (generated output)
+exported_rules/
+
+# Environment file with credentials
+.env
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python virtual environments
+.venv/
+__pycache__/

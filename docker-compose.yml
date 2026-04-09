@@ -1,0 +1,26 @@
+services:
+  splunk:
+    platform: linux/amd64
+    image: splunk/splunk:latest
+    container_name: splunk-lab
+    hostname: splunk-lab
+    environment:
+      - SPLUNK_START_ARGS=--accept-license
+      - SPLUNK_GENERAL_TERMS=--accept-sgt-current-at-splunk-com
+      - SPLUNK_PASSWORD=${SPLUNK_PASSWORD:-ChangeMeN0w!}
+      - SPLUNK_HEC_TOKEN=${SPLUNK_HEC_TOKEN:-a1b2c3d4-e5f6-7890-abcd-ef1234567890}
+    ports:
+      - "8000:8000"
+      - "8088:8088"
+      - "8089:8089"
+      - "9997:9997"
+    volumes:
+      - splunk-var:/opt/splunk/var
+      - splunk-etc:/opt/splunk/etc
+      - ./apps:/opt/splunk/etc/apps/custom_apps
+      - ./data:/tmp/data
+    restart: unless-stopped
+
+volumes:
+  splunk-var:
+  splunk-etc:
