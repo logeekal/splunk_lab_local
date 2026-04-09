@@ -23,8 +23,8 @@ echo ""
 echo "[2/6] Starting Splunk container..."
 docker compose up -d
 echo "Waiting for Splunk to be ready..."
-until curl -ks "${SPLUNK_URL}/services/server/health/splunkd" \
-  -u "$SPLUNK_AUTH" 2>/dev/null | grep -q '"status":"green"\|"status":"yellow"'; do
+until curl -ks "${SPLUNK_URL}/services/server/info?output_mode=json" \
+  -u "$SPLUNK_AUTH" 2>/dev/null | python3 -c "import sys,json; json.load(sys.stdin)" 2>/dev/null; do
   printf "."
   sleep 5
 done
@@ -43,9 +43,27 @@ fi
 
 echo "  Building ESCU app..."
 cd repos/security_content
-python3 -m venv .venv 2>/dev/null || true
+
+PYTHON_311=""
+if command -v mise &>/dev/null; then
+  mise install python@3.11 2>/dev/null || true
+  PYTHON_311="$(mise where python@3.11 2>/dev/null)/bin/python3.11" || true
+fi
+if [ -z "$PYTHON_311" ] || [ ! -x "$PYTHON_311" ]; then
+  PYTHON_311="$(command -v python3.11 2>/dev/null || command -v python3)"
+fi
+
+"$PYTHON_311" -m venv .venv 2>/dev/null || true
 source .venv/bin/activate
 pip install -q contentctl
+
+if [ ! -d "external_repos/atomic-red-team" ]; then
+  git clone --depth 1 --single-branch https://github.com/redcanaryco/atomic-red-team external_repos/atomic-red-team
+fi
+if [ ! -d "external_repos/cti" ]; then
+  git clone --depth 1 --single-branch https://github.com/mitre/cti external_repos/cti
+fi
+
 contentctl build --enrichments
 deactivate
 cd "$SCRIPT_DIR"
@@ -60,25 +78,23 @@ echo "  Built: $ESCU_APP"
 # ── Step 4: Install ESCU on Splunk ──
 echo ""
 echo "[4/6] Installing ESCU app on Splunk..."
-curl -ks -u "$SPLUNK_AUTH" \
-  "${SPLUNK_URL}/services/apps/local" \
-  -F "name=$(basename "$ESCU_APP")" \
-  -F "filename=true" \
-  -F "update=true" \
-  -F "appfile=@${ESCU_APP}" > /dev/null
+docker cp "${ESCU_APP}" splunk-lab:/tmp/escu.tar.gz
+docker exec -u splunk splunk-lab /opt/splunk/bin/splunk install app /tmp/escu.tar.gz -auth "$SPLUNK_AUTH"
 
 echo "  ESCU installed. Restarting Splunk..."
-curl -ks -u "$SPLUNK_AUTH" \
-  "${SPLUNK_URL}/services/server/control/restart" \
-  -X POST > /dev/null
-sleep 10
-until curl -ks "${SPLUNK_URL}/services/server/health/splunkd" \
-  -u "$SPLUNK_AUTH" 2>/dev/null | grep -q '"status":"green"\|"status":"yellow"'; do
+docker exec -u splunk splunk-lab /opt/splunk/bin/splunk restart -auth "$SPLUNK_AUTH" &
+sleep 30
+until curl -ks "${SPLUNK_URL}/services/server/info?output_mode=json" \
+  -u "$SPLUNK_AUTH" 2>/dev/null | python3 -c "import sys,json; json.load(sys.stdin)" 2>/dev/null; do
   printf "."
   sleep 5
 done
 echo ""
-echo "  Splunk restarted with ESCU."
+
+RULE_COUNT=$(curl -ks "${SPLUNK_URL}/servicesNS/-/-/saved/searches?output_mode=json&count=0&search=ESCU" \
+  -u "$SPLUNK_AUTH" 2>/dev/null \
+  | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('entry',[])))" 2>/dev/null || echo "?")
+echo "  Splunk restarted with ESCU. Loaded ${RULE_COUNT} saved searches."
 
 # ── Step 5: Clone attack_data ──
 echo ""
@@ -93,9 +109,18 @@ fi
 # ── Step 6: Enable HEC ──
 echo ""
 echo "[6/6] Enabling HTTP Event Collector..."
+HEC_TOKEN="${SPLUNK_HEC_TOKEN:-a1b2c3d4-e5f6-7890-abcd-ef1234567890}"
 curl -ks -u "$SPLUNK_AUTH" \
-  "${SPLUNK_URL}/servicesNS/admin/splunk_httpinput/data/inputs/http/http" \
+  "${SPLUNK_URL}/servicesNS/nobody/splunk_httpinput/data/inputs/http/http" \
   -X POST \
+  -d "disabled=0" > /dev/null 2>&1 || true
+
+curl -ks -u "$SPLUNK_AUTH" \
+  "${SPLUNK_URL}/servicesNS/nobody/splunk_httpinput/data/inputs/http" \
+  -X POST \
+  -d "name=attack_data" \
+  -d "token=${HEC_TOKEN}" \
+  -d "index=main" \
   -d "disabled=0" > /dev/null 2>&1 || true
 
 echo ""
