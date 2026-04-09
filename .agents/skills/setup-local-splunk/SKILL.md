@@ -28,24 +28,17 @@ Spin up a local Splunk Enterprise instance via Docker with 2000+ ESCU detection 
 
 ## Quick Start
 
-Run the setup script:
+From the repo root (`~/projects/Splunk_lab`):
 
 ```bash
-./scripts/setup_local_splunk.sh <target_directory>
-```
-
-Example:
-
-```bash
-./scripts/setup_local_splunk.sh ~/projects/Splunk_lab
+./setup.sh
 ```
 
 This will:
-1. Create the directory with `docker-compose.yml` and helper scripts
-2. Start Splunk Enterprise (runs under Rosetta on Apple Silicon)
-3. Clone `splunk/security_content` and build the ESCU app
-4. Clone `splunk/attack_data` for test datasets
-5. Install ESCU on Splunk and enable HEC
+1. Start Splunk Enterprise via `docker compose up` (runs under Rosetta on Apple Silicon)
+2. Clone `splunk/security_content` and build the ESCU app
+3. Clone `splunk/attack_data` for test datasets
+4. Install ESCU on Splunk and enable HEC
 
 ## Manual Step: Install Technology Add-ons (REQUIRED)
 
@@ -74,10 +67,9 @@ docker exec -u splunk splunk-lab /opt/splunk/bin/splunk restart -auth admin:Chan
 
 ## Ingesting Attack Data
 
-After setup, ingest test datasets:
+After setup and TA installation, ingest test datasets:
 
 ```bash
-cd <target_directory>
 ./ingest_data.sh
 ```
 
@@ -150,7 +142,7 @@ List all stories with detection counts:
 ## Teardown
 
 ```bash
-cd <target_directory>
+./teardown.sh            # Interactive: stop, optionally delete volumes
 docker compose down      # Stop, preserve data
 docker compose down -v   # Stop and delete all data
 ```
